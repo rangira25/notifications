@@ -1,68 +1,90 @@
 package main
 
 import (
-    "context"
-    "encoding/json"
-    "fmt"
-    "log"
-    "os"
-    "time"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"log"
+	"os"
+	"time"
 
-    "github.com/joho/godotenv"
-    "github.com/rangira25/notification/internal/kafka"
-    "github.com/rangira25/notification/internal/services"
+	"github.com/joho/godotenv"
+	"github.com/rangira25/notification/internal/kafka"
+	"github.com/rangira25/notification/internal/services"
+	"github.com/rangira25/notification/internal/storage"
 )
 
 func main() {
+	// Load .env file
+	if err := godotenv.Load(); err != nil {
+		log.Println("worker: .env file not found, using environment variables")
+	}
 
-    // Load .env file
-    if err := godotenv.Load(); err != nil {
-        log.Println("⚠️  .env file not found, using system environment variables.")
-    }
+	// Redis for idempotency and app features
+	redisAddr := os.Getenv("REDIS_ADDR")
+	redisPass := os.Getenv("REDIS_PASSWORD")
+	if redisAddr == "" {
+		redisAddr = "localhost:6379"
+	}
+	rdb := storage.NewRedis(redisAddr, redisPass)
 
-    // Read Email configs
-    smtpHost := os.Getenv("SMTP_HOST")
-    smtpPort := os.Getenv("SMTP_PORT")
-    smtpUser := os.Getenv("SMTP_USER")
-    smtpPass := os.Getenv("SMTP_PASS")
+	// Read SMTP config from env
+	smtpHost := os.Getenv("SMTP_HOST")
+	smtpPort := os.Getenv("SMTP_PORT")
+	smtpUser := os.Getenv("SMTP_USER")
+	smtpPass := os.Getenv("SMTP_PASS")
+	if smtpHost == "" || smtpPort == "" || smtpUser == "" || smtpPass == "" {
+		log.Fatal("missing SMTP_* env vars")
+	}
+	emailSvc := services.NewEmailService(smtpHost, smtpPort, smtpUser, smtpPass)
 
-    if smtpHost == "" || smtpPort == "" || smtpUser == "" || smtpPass == "" {
-        log.Fatal("❌ Missing SMTP_* environment variables in .env")
-    }
+	// Kafka config
+	kafkaBroker := os.Getenv("KAFKA_BROKER")
+	if kafkaBroker == "" {
+		kafkaBroker = "185.***.***.***:9092" // fallback
+	}
+	brokers := []string{kafkaBroker}
+	topic := "notifications"
 
-    // Kafka configs
-    brokers := []string{os.Getenv("KAFKA_BROKER")}
-    if brokers[0] == "" {
-        brokers = []string{"185.***.***.***:9092"} // fallback
-    }
-    topic := "notifications"
+	fmt.Println("starting kafka consumer with idempotency via redis")
+	kafka.StartConsumerWithHandler(brokers, topic, func(msgBytes []byte) {
+		// compute message fingerprint for idempotency
+		sum := sha256.Sum256(msgBytes)
+		key := "kafka:msg:" + hex.EncodeToString(sum[:])
 
-    // Initialize Email Service
-    emailSvc := services.NewEmailService(smtpHost, smtpPort, smtpUser, smtpPass)
+		// Try setnx (only process if not already processed)
+		// Use 24h TTL to avoid reprocessing same message within that window
+		set, err := rdb.SetNX(context.Background(), key, "1", 24*time.Hour).Result()
+		if err != nil {
+			// Redis error -> log and continue (we might reprocess)
+			log.Printf("redis SetNX error: %v - will attempt to process message", err)
+		}
+		if !set {
+			log.Printf("skipping already-processed message (key=%s)", key)
+			return
+		}
 
-    kafka.StartConsumerWithHandler(brokers, topic, func(msgBytes []byte) {
-        var msg kafka.NotificationMessage
+		// Unmarshal structured JSON
+		var msg kafka.NotificationMessage
+		if err := json.Unmarshal(msgBytes, &msg); err != nil {
+			log.Printf("invalid kafka json: %v", err)
+			return
+		}
 
-        // Parse the structured JSON message
-        if err := json.Unmarshal(msgBytes, &msg); err != nil {
-            fmt.Println("❌ Invalid JSON message:", err)
-            return
-        }
+		// Send email with a context deadline
+		ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+		defer cancel()
+		log.Printf("sending email to %s (subject=%s)", msg.Email, msg.Subject)
+		if err := emailSvc.SendEmail(ctx, msg.Email, msg.Subject, msg.Body); err != nil {
+			// If email fails, you might want to remove the idempotency key so it can retry:
+			// rdb.Del(context.Background(), key)
+			log.Printf("email send error: %v", err)
+			return
+		}
+		log.Printf("email sent to %s", msg.Email)
+	})
 
-        fmt.Printf("📨 Sending email to %s (subject: %s)\n", msg.Email, msg.Subject)
-
-        // Context with timeout for SMTP
-        ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
-        defer cancel()
-
-        // Updated call — now correct
-        err := emailSvc.SendEmail(ctx, msg.Email, msg.Subject, msg.Body)
-        if err != nil {
-            log.Println("❌ Email failed:", err)
-        } else {
-            fmt.Println("✅ Email sent!")
-        }
-    })
-
-    select {} // keeps worker alive
+	select {}
 }
