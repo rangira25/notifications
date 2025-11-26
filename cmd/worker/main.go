@@ -1,90 +1,130 @@
 package main
 
 import (
-	"context"
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
-	"fmt"
-	"log"
-	"os"
-	"time"
+    "context"
+    "encoding/json"
+    "fmt"
+    "log"
+    "os"
 
-	"github.com/joho/godotenv"
-	"github.com/rangira25/notification/internal/kafka"
-	"github.com/rangira25/notification/internal/services"
-	"github.com/rangira25/notification/internal/storage"
+    "github.com/joho/godotenv"
+
+    "github.com/redis/go-redis/v9"
+    "github.com/IBM/sarama"
+
+    "github.com/rangira25/notification/internal/services"
+    "github.com/rangira25/user_service/shared/tasks"
 )
 
 func main() {
-	// Load .env file
-	if err := godotenv.Load(); err != nil {
-		log.Println("worker: .env file not found, using environment variables")
-	}
+    // Load .env
+    godotenv.Load()
 
-	// Redis for idempotency and app features
-	redisAddr := os.Getenv("REDIS_ADDR")
-	redisPass := os.Getenv("REDIS_PASSWORD")
-	if redisAddr == "" {
-		redisAddr = "localhost:6379"
-	}
-	rdb := storage.NewRedis(redisAddr, redisPass)
+    // -------------------------
+    // Email Service
+    // -------------------------
+    emailSvc := services.NewEmailService(
+        os.Getenv("SMTP_HOST"),
+        os.Getenv("SMTP_PORT"),
+        os.Getenv("SMTP_USER"),
+        os.Getenv("SMTP_PASS"),
+    )
 
-	// Read SMTP config from env
-	smtpHost := os.Getenv("SMTP_HOST")
-	smtpPort := os.Getenv("SMTP_PORT")
-	smtpUser := os.Getenv("SMTP_USER")
-	smtpPass := os.Getenv("SMTP_PASS")
-	if smtpHost == "" || smtpPort == "" || smtpUser == "" || smtpPass == "" {
-		log.Fatal("missing SMTP_* env vars")
-	}
-	emailSvc := services.NewEmailService(smtpHost, smtpPort, smtpUser, smtpPass)
+    // -------------------------
+    // Redis Client
+    // -------------------------
+    rdb := redis.NewClient(&redis.Options{
+        Addr:     os.Getenv("REDIS_ADDR"),
+        Password: "",
+        DB:       0,
+    })
 
-	// Kafka config
-	kafkaBroker := os.Getenv("KAFKA_BROKER")
-	if kafkaBroker == "" {
-		kafkaBroker = "185.***.***.***:9092" // fallback
-	}
-	brokers := []string{kafkaBroker}
-	topic := "notifications"
+    // -------------------------
+    // Kafka Config
+    // -------------------------
+    kafkaBrokers := []string{os.Getenv("KAFKA_BROKER")}
+    kafkaTopic := os.Getenv("KAFKA_TOPIC")
 
-	fmt.Println("starting kafka consumer with idempotency via redis")
-	kafka.StartConsumerWithHandler(brokers, topic, func(msgBytes []byte) {
-		// compute message fingerprint for idempotency
-		sum := sha256.Sum256(msgBytes)
-		key := "kafka:msg:" + hex.EncodeToString(sum[:])
+    go startRedisWorker(rdb, emailSvc)
+    go startKafkaWorker(kafkaBrokers, kafkaTopic)
 
-		// Try setnx (only process if not already processed)
-		// Use 24h TTL to avoid reprocessing same message within that window
-		set, err := rdb.SetNX(context.Background(), key, "1", 24*time.Hour).Result()
-		if err != nil {
-			// Redis error -> log and continue (we might reprocess)
-			log.Printf("redis SetNX error: %v - will attempt to process message", err)
-		}
-		if !set {
-			log.Printf("skipping already-processed message (key=%s)", key)
-			return
-		}
+    fmt.Println("🚀 Notification Worker Started (Redis + Kafka)")
 
-		// Unmarshal structured JSON
-		var msg kafka.NotificationMessage
-		if err := json.Unmarshal(msgBytes, &msg); err != nil {
-			log.Printf("invalid kafka json: %v", err)
-			return
-		}
+    select {} // block forever
+}
 
-		// Send email with a context deadline
-		ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
-		defer cancel()
-		log.Printf("sending email to %s (subject=%s)", msg.Email, msg.Subject)
-		if err := emailSvc.SendEmail(ctx, msg.Email, msg.Subject, msg.Body); err != nil {
-			// If email fails, you might want to remove the idempotency key so it can retry:
-			// rdb.Del(context.Background(), key)
-			log.Printf("email send error: %v", err)
-			return
-		}
-		log.Printf("email sent to %s", msg.Email)
-	})
+//
+// ──────────────────────────────────────────────────────────────
+//   REDIS WORKER – EMAIL SENDER
+// ──────────────────────────────────────────────────────────────
+//
 
-	select {}
+func startRedisWorker(rdb *redis.Client, emailSvc *services.EmailService) {
+    ctx := context.Background()
+
+    fmt.Println("📥 Redis Worker running…")
+
+    for {
+        res, err := rdb.BLPop(ctx, 0, "queue:notifications").Result()
+        if err != nil {
+            fmt.Println("❌ Redis error:", err)
+            continue
+        }
+
+        var payload tasks.NotificationPayload
+        if err := json.Unmarshal([]byte(res[1]), &payload); err != nil {
+            fmt.Println("❌ Invalid JSON payload:", err)
+            continue
+        }
+
+        fmt.Printf("📨 Sending email → %s\n", payload.Email)
+
+        err = emailSvc.SendEmail(ctx, payload.Email, payload.Subject, payload.Body)
+        if err != nil {
+            fmt.Println("❌ Email error:", err)
+        } else {
+            fmt.Println("✅ Email sent successfully!")
+        }
+    }
+}
+
+//
+// ──────────────────────────────────────────────────────────────
+//   KAFKA WORKER – EVENT LISTENER
+// ──────────────────────────────────────────────────────────────
+//
+
+func startKafkaWorker(brokers []string, topic string) {
+    fmt.Println("📡 Kafka Worker running…")
+
+    config := sarama.NewConfig()
+    config.Consumer.Return.Errors = true
+    config.Version = sarama.V3_4_0_0
+
+    consumer, err := sarama.NewConsumer(brokers, config)
+    if err != nil {
+        log.Fatalf("❌ Kafka consumer error: %v", err)
+    }
+
+    partitions, err := consumer.Partitions(topic)
+    if err != nil {
+        log.Fatalf("❌ Kafka partitions error: %v", err)
+    }
+
+    for _, p := range partitions {
+        go func(partition int32) {
+            pc, err := consumer.ConsumePartition(topic, partition, sarama.OffsetNewest)
+            if err != nil {
+                log.Printf("❌ Partition error %v: %v\n", partition, err)
+                return
+            }
+
+            fmt.Println("📡 Kafka listening on partition:", partition)
+
+            for msg := range pc.Messages() {
+                fmt.Printf("📥 Kafka Event → %s\n", string(msg.Value))
+                // Later: process events, analytics, etc.
+            }
+        }(p)
+    }
 }
